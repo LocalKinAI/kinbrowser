@@ -1,5 +1,93 @@
 # Changelog
 
+## [0.2.1] - 2026-05-20
+
+Three production failures observed in a real KinClaw session
+("看看加州大火"), three small fixes.
+
+### Bug 1: CNN timed out at L3 chromedp (20s too short)
+
+```
+kinbrowser: all backends failed; chromedp last error: cdp navigate
+https://www.cnn.com/...: context deadline exceeded
+```
+
+Modern news sites (CNN, NYT, WaPo) are JS+tracker-heavy. 20s wasn't
+enough for DOM-stable. Bumped L3 timeout to **30s**.
+
+### Bug 2: weather.com timed out at L1 (5s too aggressive)
+
+```
+kinbrowser: Get "https://weather.com/...": context deadline exceeded
+```
+
+Slow servers (some news, gov, slow blogs) needed >5s to deliver HTML.
+Bumped L1 timeout to **10s**. Worst-case full escalation now ~50s
+(10+10+30), still under CLI's 90s outer budget.
+
+### Bug 3: Google bot wall returned as "successful content"
+
+```
+URL: https://www.google.com/search?q=California+wildfires...
+[kinbrowser] L1 http | About this page... | 351 chars
+**About this page** — Our systems have detected unusual traffic from
+your computer network. This page checks to see if it's really you...
+```
+
+The bot challenge page returned HTTP 200; readability extracted the
+challenge prose; L1 accepted 351 chars as "real content"; LLM was fed
+useless content thinking it was the search results.
+
+**Two-part fix**:
+
+1. **Added 11 anti-bot wall patterns** to `jsRequiredStubs`:
+   - `unusual traffic from your computer network` (Google search)
+   - `our systems have detected unusual` (Google variant)
+   - `checking if the site connection is secure` (Cloudflare)
+   - `verifying you are human` (Cloudflare Turnstile)
+   - `please verify you are a human`
+   - `please complete the security check`
+   - `access denied`
+   - `rate limit exceeded`
+   - `too many requests`
+   - `please solve this captcha`
+   - `sorry, you have been blocked` (Cloudflare generic)
+
+2. **Final L3 acceptance check**: after L3 chromedp returns, if the
+   content still hits a stub pattern (Google blocks chromedp too —
+   they fingerprint headless Chrome), surface a CLEAR error message:
+
+   ```
+   all 3 backends returned stub/anti-bot wall for <url>
+   (URL likely blocks automation; try a different source, or use
+   web_search for search queries)
+   ```
+
+   Better to return error than feed the LLM a bot-challenge page.
+   The kinclaw skill converts this into readable markdown for the
+   LLM via the v0.79fb55b "content not Go error" path.
+
+### Files
+
+    pkg/kinbrowser/kinbrowser.go        MOD  +11 stub patterns, L3 stub check, +5s L1 timeout, +10s L3 timeout
+    pkg/kinbrowser/kinbrowser_test.go   MOD  +TestAcceptable_DetectsBotWalls, +TestDefaultTimeouts_TunedForRealSites
+    CHANGELOG.md                        MOD  this entry
+
+### Tests
+
+    18/18 pass (was 16/16; added 2 lock-in tests)
+
+### Lesson
+
+> Anti-bot defense is asymmetric: Google specifically blocks chromedp's
+> HeadlessChrome fingerprint. No amount of UA spoofing fully fools
+> them. Best response: detect and surface "this URL won't work via
+> automation" instead of feeding LLM the challenge page as if it were
+> content. The LLM has web_search for actual search; kinbrowser is
+> for content URLs, not search engines.
+
+---
+
 ## [0.2.0] - 2026-05-20
 
 Six audit issues addressed in one tag. User asked the right question

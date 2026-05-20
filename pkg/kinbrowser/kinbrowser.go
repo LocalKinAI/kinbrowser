@@ -168,14 +168,21 @@ func New(opts ...Option) (*Browser, error) {
 		return nil, err
 	}
 	b := &Browser{
-		cache:             cache,
-		autoLightpanda:    true, // ← default: auto-detect Lightpanda on PATH
-		chromedpEnabled:   true,
-		chromeProfile:     defaultChromeProfile(), // persistent cookies/session
-		httpTimeout:       5 * time.Second,        // fast-fail L1
-		lightpandaTimeout: 10 * time.Second,       // L2 — JS hydration on most SPAs
-		chromedpTimeout:   20 * time.Second,       // L3 — Chrome startup + full render
-		minMarkdown:       200,                    // ~50 words
+		cache:           cache,
+		autoLightpanda:  true, // ← default: auto-detect Lightpanda on PATH
+		chromedpEnabled: true,
+		chromeProfile:   defaultChromeProfile(), // persistent cookies/session
+		// Per-layer timeouts. Empirically tuned against real targets:
+		//   - L1 5s was too aggressive for slow news servers
+		//     (weather.com timed out in 5s but is otherwise reachable)
+		//   - L3 20s was too aggressive for JS-heavy news
+		//     (CNN couldn't DOM-stable in 20s; needed 25-30s)
+		// New budgets total ~50s worst case (10+10+30), still well
+		// under the CLI's outer 90s default ceiling.
+		httpTimeout:       10 * time.Second, // L1 — accommodates slow servers
+		lightpandaTimeout: 10 * time.Second, // L2 — JS hydration on most SPAs
+		chromedpTimeout:   30 * time.Second, // L3 — full Chrome on heavy news sites
+		minMarkdown:       200,              // ~50 words
 	}
 	for _, opt := range opts {
 		opt(b)
@@ -273,10 +280,22 @@ func (b *Browser) Open(ctx context.Context, url string) (Result, error) {
 		}
 	}
 
-	// Layer 3: chromedp (full Chrome)
+	// Layer 3: chromedp (full Chrome) — last resort.
 	if b.chromedpEnabled {
 		if r, err := b.fetchCDP(ctx, url, ""); err == nil {
 			r.Layer = 3
+			// Even L3 with persistent Chrome profile + real-Chrome UA
+			// can hit anti-bot walls (Google search results, hardened
+			// Cloudflare). If THAT still looks like stub/bot-wall,
+			// surface a clear failure to the caller — better the LLM
+			// reads "this URL is blocked" than gets fed an "unusual
+			// traffic" challenge page as if it were content.
+			if !b.acceptable(r) {
+				return Result{}, fmt.Errorf(
+					"all 3 backends returned stub/anti-bot wall for %s "+
+						"(URL likely blocks automation; try a different source, "+
+						"or use web_search for search queries)", url)
+			}
 			b.cache.Add(url, r)
 			return r, nil
 		} else {
@@ -383,11 +402,25 @@ func (b *Browser) acceptable(r Result) bool {
 	return true
 }
 
-// jsRequiredStubs — markdown fragments that signal "this is the
-// pre-hydration HTML, not the real content". Each one was empirically
-// observed on a known CSR site that L1 fails on (x.com, instagram,
-// etc.). Lowercase comparisons.
+// jsRequiredStubs — markdown fragments that signal "this is NOT real
+// content — escalate". Two categories:
+//
+//  1. JS-required stubs — page is pre-hydration, LLM needs a JS engine
+//     (x.com, instagram, react-app placeholders, etc.).
+//
+//  2. Anti-bot walls — server returned HTTP 200 with a challenge page
+//     (Google "unusual traffic", Cloudflare "checking browser",
+//     Akamai "access denied", etc.). readability extracts the
+//     challenge text and L1 would wrongly accept it.
+//
+// For #2, escalation to L3 chromedp with the persistent profile
+// (v0.2.0) sometimes gets past — real Chrome fingerprint + warm
+// cookies fool some walls. When it doesn't, the failure surfaces
+// cleanly to the LLM via the kinclaw skill's content-on-fail path.
+//
+// Lowercase comparisons. Add a new pattern when observed in the wild.
 var jsRequiredStubs = []string{
+	// JS-required stubs (observed: x.com, instagram, react placeholders)
 	"enable javascript",
 	"javascript is required",
 	"javascript is disabled",
@@ -397,6 +430,21 @@ var jsRequiredStubs = []string{
 	"this site can't be reached",
 	"you need to enable javascript to run", // create-react-app default
 	"this app requires javascript",
+
+	// Anti-bot walls (added 2026-05-20 after California-wildfire
+	// session showed Google's bot challenge being returned as
+	// "successful content" with HTTP 200)
+	"unusual traffic from your computer network", // Google search bot wall
+	"our systems have detected unusual",          // Google variant
+	"checking if the site connection is secure",  // Cloudflare challenge
+	"verifying you are human",                    // Cloudflare Turnstile
+	"please verify you are a human",
+	"please complete the security check",
+	"access denied",
+	"rate limit exceeded",
+	"too many requests",
+	"please solve this captcha",
+	"sorry, you have been blocked", // Cloudflare generic block
 }
 
 // recallFromKinBrain checks if the user previously archived this URL.

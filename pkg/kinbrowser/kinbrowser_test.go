@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestExtract_RoundTrip — give the extractor a hand-crafted HTML page
@@ -150,6 +151,49 @@ func TestAcceptable_DetectsJSStubs(t *testing.T) {
 		if b.acceptable(Result{Markdown: md}) {
 			t.Errorf("stub should NOT be acceptable, would have skipped L2/L3 escalation: %q...", md[:60])
 		}
+	}
+}
+
+// TestAcceptable_DetectsBotWalls — anti-bot challenge pages return
+// HTTP 200 with prose; readability extracts the prose; previously
+// kinbrowser would wrongly accept this as content (e.g. Google's
+// "unusual traffic" page in California-wildfire session). Added after
+// observing each pattern in the wild.
+func TestAcceptable_DetectsBotWalls(t *testing.T) {
+	b, _ := New()
+	pad := strings.Repeat("padding ", 30)
+	stubs := []string{
+		// Google search bot wall
+		"About this page. Our systems have detected unusual traffic from your computer network. " + pad,
+		// Cloudflare challenge
+		"Checking if the site connection is secure. " + pad,
+		// Cloudflare Turnstile
+		"Verifying you are human. " + pad,
+		// Generic block pages
+		"Access denied. You don't have permission to access this resource. " + pad,
+		"Sorry, you have been blocked. " + pad,
+		// Rate limit
+		"Rate limit exceeded. Please try again later. " + pad,
+	}
+	for _, md := range stubs {
+		if b.acceptable(Result{Markdown: md}) {
+			t.Errorf("anti-bot wall should NOT be acceptable: %q...", md[:80])
+		}
+	}
+}
+
+// TestDefaultTimeouts_TunedForRealSites — locks in the v0.2.1 timing
+// changes against accidental regression. CNN needed >20s for L3;
+// weather.com needed >5s for L1. Future contributors who think
+// "let's tighten timeouts to fail fast" will see this test fail and
+// look at the comment explaining why.
+func TestDefaultTimeouts_TunedForRealSites(t *testing.T) {
+	b, _ := New()
+	if b.httpTimeout < 10*time.Second {
+		t.Errorf("L1 httpTimeout = %v; must be ≥10s (weather.com case)", b.httpTimeout)
+	}
+	if b.chromedpTimeout < 30*time.Second {
+		t.Errorf("L3 chromedpTimeout = %v; must be ≥30s (CNN case)", b.chromedpTimeout)
 	}
 }
 
