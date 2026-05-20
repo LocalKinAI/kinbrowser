@@ -1,0 +1,19 @@
+# Compiled binaries
+/kinbrowser
+/cmd/kinbrowser/kinbrowser
+/dist/
+
+# Test cache / artifacts
+*.test
+*.out
+coverage.*
+
+# Local debug dumps
+*.html.tmp
+*.md.tmp
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
