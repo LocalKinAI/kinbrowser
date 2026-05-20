@@ -1,6 +1,7 @@
 package kinbrowser
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -16,6 +17,8 @@ import (
 // fetchHTTP implements Layer 1: plain HTTP GET → readability → html→markdown.
 // Returns a sentinel nonHTTPError on parse/extract failure (so the caller
 // knows to escalate). Network/HTTP errors are returned as-is.
+//
+// Uses b.httpTimeout (default 5s — fast fail to leave time for L2/L3).
 func (b *Browser) fetchHTTP(ctx context.Context, rawURL string) (Result, error) {
 	ctx, cancel := context.WithTimeout(ctx, b.httpTimeout)
 	defer cancel()
@@ -42,9 +45,17 @@ func (b *Browser) fetchHTTP(ctx context.Context, rawURL string) (Result, error) 
 		return Result{}, nonHTTPError{inner: fmt.Errorf("HTTP %d", resp.StatusCode)}
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20)) // 10 MB cap
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 20<<20)) // 20 MB cap (PDFs are bigger)
 	if err != nil {
 		return Result{}, err
+	}
+
+	// Content-Type sniffing: if it's a PDF, route to extractPDF instead
+	// of readability. Catches both explicit application/pdf and the
+	// magic-byte "%PDF-" prefix (some servers misreport Content-Type).
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "application/pdf") || bytes.HasPrefix(body, []byte("%PDF-")) {
+		return b.extractPDF(rawURL, body)
 	}
 
 	return b.extract(rawURL, body)

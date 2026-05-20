@@ -22,11 +22,15 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
+	"os/exec"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/LocalKinAI/kinbrowser/pkg/kinbrowser"
@@ -78,6 +82,8 @@ func main() {
 		runOpen(os.Args[2:], false)
 	case "archive":
 		runOpen(os.Args[2:], true)
+	case "daemon":
+		runDaemon(os.Args[2:])
 	default:
 		fmt.Fprintf(os.Stderr, "kinbrowser: unknown command %q\n\n%s", os.Args[1], usage)
 		os.Exit(2)
@@ -202,4 +208,96 @@ func truncate(s string, n int) string {
 func die(msg string) {
 	fmt.Fprintln(os.Stderr, "kinbrowser: "+msg)
 	os.Exit(1)
+}
+
+// runDaemon handles Lightpanda daemon lifecycle from the CLI:
+//
+//	kinbrowser daemon status   show pid + listening + uptime
+//	kinbrowser daemon start    explicit start (auto-detect normally does this)
+//	kinbrowser daemon stop     kill the running daemon
+//
+// Auto-spawn in normal `kinbrowser open` calls covers 99% of usage —
+// these subcommands are for operators who want explicit control:
+// debugging weird behavior, freeing the port, or pre-warming the
+// daemon before a batch run.
+func runDaemon(args []string) {
+	if len(args) == 0 {
+		die("daemon requires subcommand: status | start | stop")
+	}
+	switch args[0] {
+	case "status":
+		daemonStatus()
+	case "start":
+		daemonStart()
+	case "stop":
+		daemonStop()
+	default:
+		die("daemon: unknown subcommand " + args[0] + " (use status|start|stop)")
+	}
+}
+
+func daemonStatus() {
+	resp, err := http.Get("http://127.0.0.1:9222/json/version")
+	if err != nil {
+		fmt.Println("not running (no CDP on 127.0.0.1:9222)")
+		os.Exit(1)
+	}
+	defer resp.Body.Close()
+	var v struct {
+		Browser              string `json:"Browser"`
+		Protocol             string `json:"Protocol-Version"`
+		WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&v)
+	fmt.Printf("running\n  browser:  %s\n  protocol: %s\n  ws:       %s\n",
+		v.Browser, v.Protocol, v.WebSocketDebuggerURL)
+
+	// Try to find the pid via lsof so the user knows what to kill if needed.
+	if out, err := exec.Command("lsof", "-iTCP:9222", "-sTCP:LISTEN", "-t").Output(); err == nil {
+		pid := strings.TrimSpace(string(out))
+		if pid != "" {
+			fmt.Printf("  pid:      %s\n", pid)
+		}
+	}
+}
+
+func daemonStart() {
+	if resp, err := http.Get("http://127.0.0.1:9222/json/version"); err == nil {
+		resp.Body.Close()
+		fmt.Println("already running on 127.0.0.1:9222 (no-op)")
+		return
+	}
+	if _, err := exec.LookPath("lightpanda"); err != nil {
+		die("lightpanda not on PATH. Install: brew install lightpanda-io/browser/lightpanda")
+	}
+	cmd := exec.Command("lightpanda", "serve", "--host", "127.0.0.1", "--port", "9222")
+	cmd.Stdout = nil
+	cmd.Stderr = nil
+	if err := cmd.Start(); err != nil {
+		die("start lightpanda: " + err.Error())
+	}
+	fmt.Printf("started lightpanda (pid %d) on 127.0.0.1:9222\n", cmd.Process.Pid)
+	// Wait for CDP to actually answer (up to 3s) before reporting success.
+	for i := 0; i < 30; i++ {
+		if resp, err := http.Get("http://127.0.0.1:9222/json/version"); err == nil {
+			resp.Body.Close()
+			fmt.Println("CDP ready")
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	fmt.Println("warning: process started but CDP never opened — try `kinbrowser daemon status`")
+}
+
+func daemonStop() {
+	out, err := exec.Command("lsof", "-iTCP:9222", "-sTCP:LISTEN", "-t").Output()
+	if err != nil || strings.TrimSpace(string(out)) == "" {
+		fmt.Println("no daemon running on 127.0.0.1:9222")
+		return
+	}
+	pid := strings.TrimSpace(string(out))
+	if err := exec.Command("kill", pid).Run(); err != nil {
+		die("kill " + pid + ": " + err.Error())
+	}
+	fmt.Printf("stopped lightpanda (pid %s)\n", pid)
 }

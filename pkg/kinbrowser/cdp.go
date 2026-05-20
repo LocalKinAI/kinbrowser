@@ -22,7 +22,14 @@ import (
 // shape is identical across all 3 layers — agents see one markdown
 // format regardless of which backend produced it.
 func (b *Browser) fetchCDP(ctx context.Context, rawURL, lightpandaURL string) (Result, error) {
-	ctx, cancel := context.WithTimeout(ctx, b.cdpTimeout)
+	// Per-layer timeout: L2 (Lightpanda) gets 10s; L3 (chromedp) gets
+	// 20s. Lightpanda is faster + spawns lighter so 10s is plenty; full
+	// Chrome may need 20s for cold start + render on heavy SPAs.
+	timeout := b.chromedpTimeout
+	if lightpandaURL != "" {
+		timeout = b.lightpandaTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	// Allocator: remote (Lightpanda) or local (Chrome via chromedp).
@@ -41,6 +48,14 @@ func (b *Browser) fetchCDP(ctx context.Context, rawURL, lightpandaURL string) (R
 			chromedp.UserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "+
 				"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
 		)
+		// Persistent user-data dir if configured — cookies, localStorage,
+		// and login state survive across kinbrowser invocations. ~10ms
+		// cold start penalty on first use (Chrome creates the profile),
+		// zero penalty after. Without this, every L3 fetch sees an
+		// empty cookie jar.
+		if b.chromeProfile != "" {
+			opts = append(opts, chromedp.UserDataDir(b.chromeProfile))
+		}
 		allocCtx, allocCancel = chromedp.NewExecAllocator(ctx, opts...)
 	}
 	defer allocCancel()

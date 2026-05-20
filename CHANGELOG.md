@@ -1,5 +1,105 @@
 # Changelog
 
+## [0.2.0] - 2026-05-20
+
+Six audit issues addressed in one tag. User asked the right question
+after sleeping on v0.1.2: "what else needs improvement?" — turned into
+a full P0/P1 sweep.
+
+### Added
+
+- **PDF support** (P0). `Content-Type: application/pdf` or `%PDF-`
+  magic prefix triggers PDF extraction instead of HTML readability.
+  Two-tier extraction:
+  - **`pdftotext`** (poppler-utils, `brew install poppler`) when on
+    PATH — proper word boundaries, multi-column layout preserved,
+    UTF-8 handling. Used for ~all macOS / Linux dev machines.
+  - **`github.com/ledongthuc/pdf`** pure-Go fallback for zero-dep
+    install. Word boundaries reconstructed via lowercase→Uppercase,
+    letter↔digit, punct→letter regex (best-effort; arxiv prose comes
+    out readable, complex layouts are degraded).
+  - Either way, output is markdown with frontmatter naming the
+    extractor used + page count.
+  - **Unlocks arxiv `/pdf/`** which is the swarm's #1 reading source
+    via paper_scout / wanshitong. Smoke-test on 1706.03762: 61 KB
+    clean markdown / 1.05 s via pdftotext.
+
+- **Chrome profile persistence** (P0). L3 (chromedp) now uses a
+  persistent `UserDataDir` (`~/.kinbrowser/chrome-profile/` by
+  default). Cookies, localStorage, login state survive across
+  kinbrowser invocations. Login-walled content (X authenticated
+  views, Substack paid, LinkedIn) works on revisit.
+  - `WithChromeProfile(dir)` Go option to override.
+  - `$KINBROWSER_CHROME_PROFILE` env override.
+  - Per-agent isolation possible by giving each agent its own dir.
+
+- **URL canonicalization** (P0). All URLs are normalized before cache
+  lookup AND before fetch:
+  - Strip 17 known tracking params (`utm_*`, `fbclid`, `gclid`,
+    `mc_eid`, `_ga`, `ref`, `igshid`, `si`, `spm`, `yclid`, ...)
+  - Drop URL fragments (`#section`)
+  - Strip trailing slash (except root)
+  - Strip default ports (`:80` / `:443`)
+  - Lowercase scheme + host
+  - Sort remaining query params for stable cache keys
+  - Idempotent: feed clean URL back in, get same string out.
+  - Cache hit rate goes up on agents that read the same article from
+    multiple referrer-tagged links.
+
+- **Per-layer timeout** (P1). Single `cdpTimeout` split into:
+  - `httpTimeout` (L1, **5 s** — fast fail)
+  - `lightpandaTimeout` (L2, **10 s**)
+  - `chromedpTimeout` (L3, **20 s**)
+  - `WithTimeouts(http, lp, chrome)` Go option overrides.
+  - Worst-case full escalation now ~35 s instead of unbounded.
+
+- **`kinbrowser daemon` subcommands** (P1):
+  - `daemon status` — report running/pid/uptime/CDP URL
+  - `daemon start` — explicit start (no-op if already running)
+  - `daemon stop` — kill the lightpanda we spawned
+  - Operator hygiene for the auto-spawned daemon.
+
+- **Diff-on-revisit** (P1). When `Open()` hits a previously archived
+  URL, kinbrowser now ALSO fetches fresh and reconciles:
+  - **Unchanged** (≥85% Jaccard line similarity) → return archive
+    with `[UNCHANGED since ...]` note. Saves the LLM a re-read.
+  - **Drift** (some lines changed) → return fresh content with a
+    unified `diff` block at the top (`+` added, `-` removed,
+    truncated to 4 KB) + the new content below. LLM sees WHAT
+    changed without re-reading the entire page.
+  - **Rewrite** (low similarity) → return fresh with `[CHANGED]`
+    warning.
+  - Closes a promise from the original v0.1.0 design that wasn't
+    implemented.
+
+### Changed
+
+- L1 HTTP body limit raised from 10 MB to **20 MB** to accommodate
+  PDF downloads (arxiv papers run 5-15 MB; long ones can be larger).
+
+### Files
+
+    pkg/kinbrowser/canon.go            NEW    87 LoC + 95 LoC tests   (URL canonicalization)
+    pkg/kinbrowser/pdf.go              NEW   200 LoC                  (PDF extraction, both backends)
+    pkg/kinbrowser/diff.go             NEW   115 LoC + 90 LoC tests   (similarity + reconciliation)
+    pkg/kinbrowser/kinbrowser.go       MOD   per-layer timeouts, chromeProfile field, options
+    pkg/kinbrowser/cdp.go              MOD   profile wired into chromedp ExecAllocator
+    pkg/kinbrowser/extract.go          MOD   PDF content-type sniff + 20 MB cap
+    cmd/kinbrowser/main.go             MOD   `daemon` subcommand tree
+    CHANGELOG.md                       MOD   this entry
+
+### Tests
+
+    16/16 pass (was 8/8 in v0.1.2; +5 canon, +4 diff, +1 force-layer follow-up)
+
+### Lesson
+
+> Wake up, audit, fix all. Six small surgical changes beat one big
+> v1.0 rewrite. Each change is independently shippable; only bundled
+> here for narrative.
+
+---
+
 ## [0.1.2] - 2026-05-20
 
 ### Why

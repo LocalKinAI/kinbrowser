@@ -57,10 +57,16 @@ type Browser struct {
 	autoLightpanda  bool   // true by default — auto-detect `lightpanda` on PATH
 	lightpandaURL   string // explicit ws://... if WithLightpanda(url) was used
 	chromedpEnabled bool   // false on headless servers without Chrome
-	httpTimeout     time.Duration
-	cdpTimeout      time.Duration
-	minMarkdown     int // minimum markdown length to consider Layer 1 "successful"
-	forceLayer      int // 0 = auto-escalate, 1/2/3 = pin to specific layer (debug)
+	chromeProfile   string // chromedp UserDataDir; persistent cookies across runs
+	// Per-layer timeouts. Each layer gets its own budget so a slow L1
+	// (e.g. server hanging) doesn't starve L2/L3 of time. Defaults
+	// chosen so that the worst-case full escalation (L1 fail + L2 fail
+	// + L3 fail) fits in ~35 s.
+	httpTimeout       time.Duration // L1 (default 5s — fast fail)
+	lightpandaTimeout time.Duration // L2 (default 10s)
+	chromedpTimeout   time.Duration // L3 (default 20s)
+	minMarkdown       int           // minimum markdown length to consider Layer 1 "successful"
+	forceLayer        int           // 0 = auto-escalate, 1/2/3 = pin to specific layer (debug)
 }
 
 // Option mutates a Browser at construction time.
@@ -92,6 +98,38 @@ func WithoutLightpandaAutoDetect() Option {
 	return func(b *Browser) { b.autoLightpanda = false }
 }
 
+// WithChromeProfile sets the Chrome UserDataDir used by Layer 3
+// (chromedp). Cookies, localStorage, and session data persist across
+// kinbrowser invocations, enabling login-walled content fetches
+// (X, Substack paid, LinkedIn, etc.) on revisit.
+//
+// Default: $HOME/.kinbrowser/chrome-profile (auto-created).
+// Pass an empty string to use Chrome's default ephemeral profile
+// (cookies lost between runs).
+//
+// Per-agent profiles: pass a per-agent dir like
+// $HOME/.kinbrowser/chrome-profile-paul to isolate one agent's
+// login state from another's.
+func WithChromeProfile(dir string) Option {
+	return func(b *Browser) { b.chromeProfile = dir }
+}
+
+// WithTimeouts overrides per-layer timeouts. Pass 0 for any field to
+// keep its default (5s L1, 10s L2, 20s L3).
+func WithTimeouts(http, lightpanda, chromedp time.Duration) Option {
+	return func(b *Browser) {
+		if http > 0 {
+			b.httpTimeout = http
+		}
+		if lightpanda > 0 {
+			b.lightpandaTimeout = lightpanda
+		}
+		if chromedp > 0 {
+			b.chromedpTimeout = chromedp
+		}
+	}
+}
+
 // WithCacheSize sets the session LRU capacity (default 128).
 func WithCacheSize(n int) Option {
 	return func(b *Browser) {
@@ -109,18 +147,35 @@ func WithForceLayer(n int) Option {
 
 // New constructs a Browser. Sane defaults: cache=128, Layer 1+3 enabled,
 // Lightpanda off (callers opt in via WithLightpanda).
+// defaultChromeProfile returns the persistent Chrome UserDataDir
+// kinbrowser uses for L3 by default. Honors $KINBROWSER_CHROME_PROFILE
+// or falls back to ~/.kinbrowser/chrome-profile/. Auto-created by
+// chromedp on first L3 fetch.
+func defaultChromeProfile() string {
+	if v := os.Getenv("KINBROWSER_CHROME_PROFILE"); v != "" {
+		return v
+	}
+	home, _ := os.UserHomeDir()
+	if home == "" {
+		return "" // no home dir → use chromedp's default ephemeral
+	}
+	return home + "/.kinbrowser/chrome-profile"
+}
+
 func New(opts ...Option) (*Browser, error) {
 	cache, err := lru.New[string, Result](128)
 	if err != nil {
 		return nil, err
 	}
 	b := &Browser{
-		cache:           cache,
-		autoLightpanda:  true, // ← default: auto-detect Lightpanda on PATH
-		chromedpEnabled: true,
-		httpTimeout:     20 * time.Second,
-		cdpTimeout:      30 * time.Second,
-		minMarkdown:     200, // ~50 words
+		cache:             cache,
+		autoLightpanda:    true, // ← default: auto-detect Lightpanda on PATH
+		chromedpEnabled:   true,
+		chromeProfile:     defaultChromeProfile(), // persistent cookies/session
+		httpTimeout:       5 * time.Second,        // fast-fail L1
+		lightpandaTimeout: 10 * time.Second,       // L2 — JS hydration on most SPAs
+		chromedpTimeout:   20 * time.Second,       // L3 — Chrome startup + full render
+		minMarkdown:       200,                    // ~50 words
 	}
 	for _, opt := range opts {
 		opt(b)
@@ -144,9 +199,10 @@ func (b *Browser) Open(ctx context.Context, url string) (Result, error) {
 	if url == "" {
 		return Result{}, errors.New("kinbrowser: url is required")
 	}
-	if !strings.Contains(url, "://") {
-		url = "https://" + url
-	}
+	// Canonicalize BEFORE cache lookup so foo?utm=x and foo?utm=y both
+	// hit the same cache entry and the backends both see the clean
+	// version.
+	url = canonicalize(url)
 
 	// Forced-layer debug mode: skip caches + escalation, pin to one backend.
 	if b.forceLayer != 0 {
@@ -158,8 +214,29 @@ func (b *Browser) Open(ctx context.Context, url string) (Result, error) {
 		return cached, nil
 	}
 
-	// Layer 0b: KinBrain archive (opt-in, no-op if kinbrain CLI absent)
+	// Layer 0b: KinBrain archive. Opt-in (no-op if kinbrain CLI absent).
+	//
+	// When we get an archive hit, we DON'T just return it — we also
+	// fetch fresh via Layer 1 and reconcile. Three outcomes:
+	//   - Pages match (≥85% similarity) → return archive with [UNCHANGED] note
+	//   - Some drift → return fresh with [CHANGED] note + unified diff
+	//   - Major rewrite → return fresh with rewrite warning
+	// This is what makes the archive useful: agents see what changed
+	// since they last looked, not just stale snapshots.
 	if archived := b.recallFromKinBrain(url); archived != nil {
+		// Skip diff if user explicitly forced a layer; the user asked
+		// for raw output, give them raw output.
+		if b.forceLayer != 0 {
+			b.cache.Add(url, *archived)
+			return *archived, nil
+		}
+		// Race the fresh fetch — if it succeeds, reconcile; if it
+		// fails (network down, etc.), fall back to archive alone.
+		if fresh, err := b.fetchHTTP(ctx, url); err == nil && b.acceptable(fresh) {
+			merged := b.reconcileArchived(*archived, fresh)
+			b.cache.Add(url, merged)
+			return merged, nil
+		}
 		b.cache.Add(url, *archived)
 		return *archived, nil
 	}
