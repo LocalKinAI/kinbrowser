@@ -1,5 +1,98 @@
 # Changelog
 
+## [0.1.2] - 2026-05-20
+
+### Why
+
+User feedback after v0.1.1: "if you detect L2 isn't installed, just
+install it yourself."
+
+v0.1.1 required users to opt into Layer 2 via `--lightpanda ws://...`
+flag AND manually run `lightpanda serve` in a separate terminal. That
+two-step ceremony made L2 effectively unused in practice — KinClaw's
+skill wrapper didn't pass the flag, so all SPA reads fell through to
+L3 chromedp (~6-7s) when L2 (~1.6s) was available.
+
+### Fix
+
+**Auto-detect + lazy-spawn**:
+
+1. On every `Open()` call where Layer 1 escalation is needed, kinbrowser
+   now:
+   - Checks for `$KINBROWSER_LIGHTPANDA_URL` env (caller-managed daemon)
+   - Probes `http://127.0.0.1:9222/json/version` (existing daemon)
+   - If neither, checks if `lightpanda` is on PATH
+   - If on PATH, **spawns `lightpanda serve --host 127.0.0.1 --port 9222`**
+     as a detached child process, waits up to 3s for the CDP endpoint,
+     then uses it for Layer 2
+   - If lightpanda isn't installed, gracefully falls through to L3
+
+2. The daemon is shared process-wide (single `sync.Mutex`-protected
+   manager) and reused across subsequent calls — the probe is cached
+   for 30s to avoid re-spawning in tight loops.
+
+3. No flag needed. `kinbrowser open https://x.com` Just Works:
+   - L1 stub detected → escalate
+   - L2 auto-detect: lightpanda installed → spawn daemon → use it
+   - 1.6s instead of 6.7s on subsequent SPA reads (daemon is hot)
+
+### Verification
+
+```
+$ kinbrowser open https://x.com
+[kinbrowser] L2 lightpanda | X. It's what's happening | 361 chars | 7.4s  ← first call (includes spawn)
+
+$ pgrep -af "lightpanda serve"
+16516 lightpanda serve --host 127.0.0.1 --port 9222
+
+$ kinbrowser open https://x.com
+[kinbrowser] L0 cache | X. It's what's happening | 361 chars | 0.0s  ← session LRU hit
+```
+
+After daemon is warm, subsequent SPA reads are ~1.5s (vs ~6-7s for L3
+chromedp). 4× speedup on the L2-eligible portion of agent traffic.
+
+### Installation hint
+
+Auto-detect requires `lightpanda` binary on PATH. Install:
+
+```bash
+brew install lightpanda-io/browser/lightpanda
+```
+
+If you don't install it, kinbrowser uses L1 → L3 (still works, just
+slower for SPA-heavy reads).
+
+### New options
+
+- `WithoutLightpandaAutoDetect()` — Go library opt-out, for tests or
+  environments where you don't want kinbrowser spawning side-processes.
+- Env: `KINBROWSER_LIGHTPANDA_URL=ws://...` — point at a remote/managed
+  daemon instead of letting kinbrowser spawn one.
+
+### Files
+
+    pkg/kinbrowser/lightpanda.go        NEW   147 LoC (manager + probe + spawn)
+    pkg/kinbrowser/kinbrowser.go        MOD   Browser.autoLightpanda field, default true; Open() wires auto-detect
+    CHANGELOG.md                        MOD   this entry
+
+### Design notes
+
+- We deliberately don't kill the daemon on kinbrowser exit. brew
+  installed it; the daemon is shared infrastructure. Next kinbrowser
+  invocation reuses via port probe.
+- The 30s probe cache avoids re-checking `/json/version` on every
+  Open() call when L2 is already known up.
+- Spawn writes daemon logs to /dev/null. If users want them, they can
+  run `lightpanda serve` themselves and we'll detect + reuse.
+
+### Lesson
+
+> Two-step ceremonies are zero-step in practice. If the dependency is
+> installable and the daemon is spawnable, do both transparently.
+
+---
+
 ## [0.1.1] - 2026-05-20
 
 ### Bug

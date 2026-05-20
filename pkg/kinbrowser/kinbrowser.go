@@ -53,8 +53,9 @@ type Result struct {
 // process (it owns the session LRU and chromedp/Lightpanda lifecycle).
 type Browser struct {
 	cache           *lru.Cache[string, Result]
-	useLightpanda   bool   // true if lightpanda binary available at CDP port
-	lightpandaURL   string // ws://localhost:9222 or similar
+	useLightpanda   bool   // true if explicit WithLightpanda() was called
+	autoLightpanda  bool   // true by default — auto-detect `lightpanda` on PATH
+	lightpandaURL   string // explicit ws://... if WithLightpanda(url) was used
 	chromedpEnabled bool   // false on headless servers without Chrome
 	httpTimeout     time.Duration
 	cdpTimeout      time.Duration
@@ -82,6 +83,15 @@ func WithoutChromedp() Option {
 	return func(b *Browser) { b.chromedpEnabled = false }
 }
 
+// WithoutLightpandaAutoDetect disables the default behavior of
+// auto-detecting `lightpanda` on PATH and lazy-spawning the daemon.
+// Caller can still explicitly enable L2 via WithLightpanda(url).
+// Useful in tests + environments where you don't want kinbrowser
+// spawning side-processes.
+func WithoutLightpandaAutoDetect() Option {
+	return func(b *Browser) { b.autoLightpanda = false }
+}
+
 // WithCacheSize sets the session LRU capacity (default 128).
 func WithCacheSize(n int) Option {
 	return func(b *Browser) {
@@ -106,6 +116,7 @@ func New(opts ...Option) (*Browser, error) {
 	}
 	b := &Browser{
 		cache:           cache,
+		autoLightpanda:  true, // ← default: auto-detect Lightpanda on PATH
 		chromedpEnabled: true,
 		httpTimeout:     20 * time.Second,
 		cdpTimeout:      30 * time.Second,
@@ -165,12 +176,23 @@ func (b *Browser) Open(ctx context.Context, url string) (Result, error) {
 		}
 	}
 
-	// Layer 2: Lightpanda (only if enabled + reachable)
-	if b.useLightpanda {
-		if r, err := b.fetchCDP(ctx, url, b.lightpandaURL); err == nil && b.acceptable(r) {
-			r.Layer = 2
-			b.cache.Add(url, r)
-			return r, nil
+	// Layer 2: Lightpanda. Three ways to enable:
+	//   (a) WithLightpanda(url) explicit option
+	//   (b) auto-detect: `lightpanda` binary on PATH → lazy-spawn daemon
+	//   (c) $KINBROWSER_LIGHTPANDA_URL env override → external daemon
+	// (a) and (c) populate b.lightpandaURL up front; (b) discovers it
+	// here on first need.
+	if b.useLightpanda || b.autoLightpanda {
+		wsURL := b.lightpandaURL
+		if wsURL == "" {
+			wsURL, _ = defaultLightpanda.detect()
+		}
+		if wsURL != "" {
+			if r, err := b.fetchCDP(ctx, url, wsURL); err == nil && b.acceptable(r) {
+				r.Layer = 2
+				b.cache.Add(url, r)
+				return r, nil
+			}
 		}
 	}
 
