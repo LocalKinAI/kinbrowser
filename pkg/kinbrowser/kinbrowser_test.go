@@ -132,6 +132,39 @@ func TestAcceptable(t *testing.T) {
 	}
 }
 
+// TestAcceptable_DetectsJSStubs — x.com served us a 222-char "Something
+// went wrong" stub that passed the length check; we have to reject it
+// to force escalation. Catch each known CSR stub pattern.
+func TestAcceptable_DetectsJSStubs(t *testing.T) {
+	b, _ := New()
+	stubs := []string{
+		// x.com observed in production
+		"Something went wrong, but don" + "’" + "t fret—let" + "’" + "s give it another shot. " + strings.Repeat("padding ", 30),
+		// create-react-app default
+		"You need to enable JavaScript to run this app. " + strings.Repeat("padding ", 30),
+		// generic
+		"Please enable cookies. " + strings.Repeat("padding ", 30),
+		"JavaScript is required to view this site. " + strings.Repeat("padding ", 30),
+	}
+	for _, md := range stubs {
+		if b.acceptable(Result{Markdown: md}) {
+			t.Errorf("stub should NOT be acceptable, would have skipped L2/L3 escalation: %q...", md[:60])
+		}
+	}
+}
+
+// TestForceLayer_PinsBackend — verify WithForceLayer(1) actually runs
+// the HTTP backend even when content is short / would normally escalate.
+func TestForceLayer_PinsBackend(t *testing.T) {
+	b, err := New(WithForceLayer(1), WithoutChromedp())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b.forceLayer != 1 {
+		t.Errorf("forceLayer = %d, want 1", b.forceLayer)
+	}
+}
+
 // TestNew_Defaults — sanity check on constructed defaults.
 func TestNew_Defaults(t *testing.T) {
 	b, err := New()

@@ -59,6 +59,7 @@ type Browser struct {
 	httpTimeout     time.Duration
 	cdpTimeout      time.Duration
 	minMarkdown     int // minimum markdown length to consider Layer 1 "successful"
+	forceLayer      int // 0 = auto-escalate, 1/2/3 = pin to specific layer (debug)
 }
 
 // Option mutates a Browser at construction time.
@@ -87,6 +88,13 @@ func WithCacheSize(n int) Option {
 		c, _ := lru.New[string, Result](n)
 		b.cache = c
 	}
+}
+
+// WithForceLayer pins all Open() calls to a specific backend (1=HTTP,
+// 2=Lightpanda, 3=chromedp). Skips Layer 0 caches and escalation logic.
+// Diagnostic only — production callers should use auto-escalation.
+func WithForceLayer(n int) Option {
+	return func(b *Browser) { b.forceLayer = n }
 }
 
 // New constructs a Browser. Sane defaults: cache=128, Layer 1+3 enabled,
@@ -127,6 +135,11 @@ func (b *Browser) Open(ctx context.Context, url string) (Result, error) {
 	}
 	if !strings.Contains(url, "://") {
 		url = "https://" + url
+	}
+
+	// Forced-layer debug mode: skip caches + escalation, pin to one backend.
+	if b.forceLayer != 0 {
+		return b.forced(ctx, url)
 	}
 
 	// Layer 0a: session LRU
@@ -175,6 +188,36 @@ func (b *Browser) Open(ctx context.Context, url string) (Result, error) {
 	return Result{}, errors.New("all backends failed and chromedp is disabled")
 }
 
+// forced runs exactly one backend (no fallback, no cache, no archive
+// check). Used by --force-layer for diagnostics.
+func (b *Browser) forced(ctx context.Context, url string) (Result, error) {
+	switch b.forceLayer {
+	case 1:
+		r, err := b.fetchHTTP(ctx, url)
+		if err != nil {
+			return r, err
+		}
+		r.Layer = 1
+		return r, nil
+	case 2:
+		r, err := b.fetchCDP(ctx, url, b.lightpandaURL)
+		if err != nil {
+			return r, err
+		}
+		r.Layer = 2
+		return r, nil
+	case 3:
+		r, err := b.fetchCDP(ctx, url, "")
+		if err != nil {
+			return r, err
+		}
+		r.Layer = 3
+		return r, nil
+	default:
+		return Result{}, fmt.Errorf("force-layer must be 1, 2, or 3 (got %d)", b.forceLayer)
+	}
+}
+
 // Archive fetches via Open() and then writes the result to KinBrain via
 // `kinbrain save web <title>`. This is the explicit "keep this" action —
 // agents should call it only when content is high-signal (paper, doc,
@@ -219,8 +262,42 @@ func (b *Browser) archiveBody(r Result) string {
 
 // acceptable returns true if the Result looks usable. Empty or too-thin
 // markdown usually means JS hydration is needed → escalate to next layer.
+//
+// Beyond length, we sniff for known "this is a JS-required stub" error
+// pages. These are usually a tiny HTML shell with "enable JavaScript"
+// or "Something went wrong" content — short enough that L1 sometimes
+// returns 250-400 chars and we'd accept it on length alone. Catching
+// them here forces L2/L3 escalation where a real JS engine can render
+// the actual page.
 func (b *Browser) acceptable(r Result) bool {
-	return len(strings.TrimSpace(r.Markdown)) >= b.minMarkdown
+	md := strings.TrimSpace(r.Markdown)
+	if len(md) < b.minMarkdown {
+		return false
+	}
+	// Pattern match: well-known stubs from CSR-heavy sites.
+	lower := strings.ToLower(md)
+	for _, stub := range jsRequiredStubs {
+		if strings.Contains(lower, stub) {
+			return false
+		}
+	}
+	return true
+}
+
+// jsRequiredStubs — markdown fragments that signal "this is the
+// pre-hydration HTML, not the real content". Each one was empirically
+// observed on a known CSR site that L1 fails on (x.com, instagram,
+// etc.). Lowercase comparisons.
+var jsRequiredStubs = []string{
+	"enable javascript",
+	"javascript is required",
+	"javascript is disabled",
+	"please enable cookies",
+	"please enable js",
+	"something went wrong, but don", // x.com / twitter stub
+	"this site can't be reached",
+	"you need to enable javascript to run", // create-react-app default
+	"this app requires javascript",
 }
 
 // recallFromKinBrain checks if the user previously archived this URL.

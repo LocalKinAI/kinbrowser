@@ -91,6 +91,7 @@ func runOpen(args []string, archive bool) {
 	quiet := fs.Bool("quiet", false, "suppress stderr layer/timing info")
 	cacheSize := fs.Int("cache", 128, "session LRU size")
 	timeoutSec := fs.Int("timeout", 30, "per-backend timeout in seconds")
+	forceLayer := fs.Int("force-layer", 0, "force a specific backend (1=HTTP, 2=Lightpanda, 3=chromedp) — debug only")
 	_ = fs.Parse(args)
 
 	rest := fs.Args()
@@ -107,6 +108,9 @@ func runOpen(args []string, archive bool) {
 	}
 	if *noChrome {
 		opts = append(opts, kinbrowser.WithoutChromedp())
+	}
+	if *forceLayer != 0 {
+		opts = append(opts, kinbrowser.WithForceLayer(*forceLayer))
 	}
 
 	b, err := kinbrowser.New(opts...)
